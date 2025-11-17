@@ -26,7 +26,7 @@ class MessageQueue:
                 if cid != exclude:
                     q.put(msg)
                     
-    def consume(self, client_id, timeout=1):
+    def consume(self, client_id, timeout=0.1):
         with self.lock:
             if client_id not in self.queues:
                 return None
