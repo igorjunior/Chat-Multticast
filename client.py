@@ -41,12 +41,13 @@ class ChatClient:
     def receive_messages(self):
         while self.running:
             try:
+                msg = None
                 with self.rpc_lock:
                     msg = self.rpc.root.exposed_get_messages(self.username)
                 if msg:
                     self.process_received_message(msg)
                 else:
-                    time.sleep(0.05)
+                    time.sleep(0.01)
             except Exception as e:
                 if self.running:
                     print(f"Erro ao receber mensagens: {e}")
@@ -60,13 +61,17 @@ class ChatClient:
             print(f"Historico sincronizado ({len(self.history)} mensagens)\n")
             
         elif tipo == 'CHAT':
-            self.history.append(msg)
+            msg_id = msg.get('msg_id')
+            if not any(m.get('msg_id') == msg_id for m in self.history):
+                self.history.append(msg)
             ts = datetime.fromtimestamp(msg['timestamp']).strftime('%H:%M:%S')
             print(f"[{ts}] {msg['sender']}: {msg['message']} (ID:{msg['msg_id']})")
             self.send_read_confirmation(msg['msg_id'])
             
         elif tipo == 'SYSTEM':
-            self.history.append(msg)
+            msg_id = msg.get('msg_id')
+            if not any(m.get('msg_id') == msg_id for m in self.history):
+                self.history.append(msg)
             ts = datetime.fromtimestamp(msg['timestamp']).strftime('%H:%M:%S')
             print(f"[{ts}] [SISTEMA] {msg['message']}")
             
@@ -78,7 +83,8 @@ class ChatClient:
             mid = msg['msg_id']
             if mid not in self.confirmations:
                 self.confirmations[mid] = []
-            self.confirmations[mid].append(msg['reader'])
+            if msg['reader'] not in self.confirmations[mid]:
+                self.confirmations[mid].append(msg['reader'])
             
     def send_message(self, text):
         with self.rpc_lock:
