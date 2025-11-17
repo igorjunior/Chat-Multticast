@@ -1,29 +1,27 @@
-import socket
 import threading
-import json
 import time
 import sys
 from datetime import datetime
+import rpyc
 from constCS import *
 
 class ChatClient:
     def __init__(self, username):
         self.username = username
-        self.sock = None
+        self.rpc = None
         self.running = False
         self.history = []
         self.confirmations = {}
+        self.rpc_lock = threading.Lock()
         
     def connect(self):
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((SERVER_HOST, SERVER_PORT))
+            self.rpc = rpyc.connect(SERVER_HOST, SERVER_PORT)
             
-            join = {
-                'type': 'JOIN',
-                'client_id': self.username
-            }
-            self.sock.send(json.dumps(join).encode('utf-8'))
+            with self.rpc_lock:
+                if not self.rpc.root.exposed_join(self.username):
+                    print("Erro: usuario ja conectado")
+                    return False
             
             self.running = True
             
@@ -43,13 +41,16 @@ class ChatClient:
     def receive_messages(self):
         while self.running:
             try:
-                data = self.sock.recv(BUFFER_SIZE)
-                if not data:
-                    break
-                msg = json.loads(data.decode('utf-8'))
-                self.process_received_message(msg)
-            except:
-                break
+                with self.rpc_lock:
+                    msg = self.rpc.root.exposed_get_messages(self.username)
+                if msg:
+                    self.process_received_message(msg)
+                else:
+                    time.sleep(0.05)
+            except Exception as e:
+                if self.running:
+                    print(f"Erro ao receber mensagens: {e}")
+                    time.sleep(0.1)
                 
     def process_received_message(self, msg):
         tipo = msg.get('type')
@@ -80,15 +81,12 @@ class ChatClient:
             self.confirmations[mid].append(msg['reader'])
             
     def send_message(self, text):
-        msg = {'type': 'CHAT', 'message': text}
-        self.sock.send(json.dumps(msg).encode('utf-8'))
+        with self.rpc_lock:
+            self.rpc.root.exposed_send_message(self.username, text)
             
     def send_read_confirmation(self, msg_id):
-        try:
-            confirm = {'type': 'READ_CONFIRM', 'msg_id': msg_id}
-            self.sock.send(json.dumps(confirm).encode('utf-8'))
-        except:
-            pass
+        with self.rpc_lock:
+            self.rpc.root.exposed_read_confirm(self.username, msg_id)
             
     def show_history(self):
         print("\n--- HISTORICO ---")
@@ -143,8 +141,10 @@ class ChatClient:
             print("\nSaindo...")
         finally:
             self.running = False
-            if self.sock:
-                self.sock.close()
+            if self.rpc:
+                with self.rpc_lock:
+                    self.rpc.root.exposed_leave(self.username)
+                self.rpc.close()
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
