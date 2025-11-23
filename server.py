@@ -22,20 +22,27 @@ class MessageQueue:
                 
     def publish(self, msg, exclude=None):
         with self.lock:
-            for cid, q in self.queues.items():
-                if cid != exclude:
+            items = list(self.queues.items())
+            
+        for cid, q in items:
+            if cid != exclude:
+                try:
                     q.put(msg)
+                except:
+                    pass
                     
     def consume(self, client_id, timeout=0.1):
+        target_q = None
         with self.lock:
-            if client_id not in self.queues:
-                return None
-            q = self.queues[client_id]
+            if client_id in self.queues:
+                target_q = self.queues[client_id]
         
-        try:
-            return q.get(timeout=timeout)
-        except queue.Empty:
-            return None
+        if target_q:
+            try:
+                return target_q.get(timeout=timeout)
+            except queue.Empty:
+                return None
+        return None
 
 class ChatServer(rpyc.Service):
     clients = {}
@@ -44,9 +51,12 @@ class ChatServer(rpyc.Service):
     lock = threading.Lock()
     msg_queue = MessageQueue()
     
-    def __init__(self):
+    def on_connect(self, conn):
         pass
-        
+
+    def on_disconnect(self, conn):
+        pass
+
     def exposed_join(self, client_id):
         with ChatServer.lock:
             if client_id in ChatServer.clients:
@@ -97,8 +107,11 @@ class ChatServer(rpyc.Service):
         return True
         
     def exposed_send_message(self, client_id, text):
-        if client_id not in ChatServer.clients:
-            return False
+        exists = False
+        with ChatServer.lock:
+            exists = client_id in ChatServer.clients
+        
+        if not exists: return False
             
         chat_msg = {
             'type': 'CHAT',
@@ -115,9 +128,6 @@ class ChatServer(rpyc.Service):
         return True
         
     def exposed_read_confirm(self, client_id, msg_id):
-        if client_id not in ChatServer.clients:
-            return False
-            
         ChatServer.msg_queue.publish({
             'type': 'READ_CONFIRM',
             'reader': client_id,
@@ -127,9 +137,7 @@ class ChatServer(rpyc.Service):
         return True
         
     def exposed_get_messages(self, client_id):
-        if client_id not in ChatServer.clients:
-            return None
-        return ChatServer.msg_queue.consume(client_id)
+        return ChatServer.msg_queue.consume(client_id, timeout=0.2)
     
     @staticmethod
     def get_next_msg_id():
