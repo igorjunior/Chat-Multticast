@@ -11,6 +11,8 @@ Recursos implementados:
 - Bootstrap leve para descoberta inicial de peers
 - Difusão eficiente com propagação controlada (N*log(N))
 - Discovery distribuído via JOIN propagado
+- **Ordenação total com Relógios de Lamport
+- Buffer de holdback para garantir ordem global
 - Heartbeat para detecção de falhas (timeout 60s)
 - Histórico replicado em todos os nós
 - Persistência de mensagens em disco
@@ -30,6 +32,8 @@ Cada nó armazena:
 - Histórico completo de mensagens (réplica local)
 - Cache de IDs processados (previne duplicatas)
 - Status de heartbeat dos peers
+- Relógio lógico de Lamport
+- Buffer de holdback para ordenação total
 
 ## Arquivos
 
@@ -125,13 +129,21 @@ Comandos disponíveis no cliente:
 O sistema usa **difusão controlada** para evitar N² mensagens:
 
 1. Usuário envia mensagem via client_ui
-2. Nó local gera ID único (`node_id_counter`)
-3. Mensagem é adicionada ao histórico local
-4. Nó propaga para subset de peers (fanout configurável)
-5. Cada peer que recebe:
+2. Nó local:
+   - Incrementa relógio de Lamport
+   - Gera ID único (`node_id_counter`)
+   - Adiciona `lamport_ts` e `origin_node` à mensagem
+   - Coloca mensagem no buffer de holdback
+3. Nó propaga para subset de peers (fanout configurável)
+4. Cada peer que recebe:
    - Verifica se já processou (cache de IDs)
-   - Adiciona ao histórico local
+   - Atualiza relógio de Lamport: `max(local, received) + 1`
+   - Adiciona ao buffer de holdback ordenado
    - Propaga para seus vizinhos
+5. Thread de entrega (a cada 100ms):
+   - Verifica mensagens estáveis no buffer
+   - Entrega na ordem `(lamport_ts, origin_node)`
+   - Move para histórico e notifica clientes
 6. Mensagem alcança todos os nós (~N*log(N) chamadas RPC)
 
 ### Detecção de Falhas
@@ -146,19 +158,33 @@ Sistema de heartbeat detecta nós inativos:
    - Mensagem SYSTEM notifica saída
 4. Se peer volta, reconecta ao bootstrap e sincroniza
 
+### Ordenação Total (Total Order Multicast)
+
+O sistema garante que **todos os peers entregam mensagens na mesma ordem global**:
+
+**Algoritmo:**
+- Cada mensagem recebe timestamp lógico de Lamport
+- Ordenação determinística: `(lamport_ts, origin_node)`
+- Buffer de holdback atrasa entrega até garantir ordem
+- Condição de estabilidade: `lamport_ts < clock_local`
+
+**Garantias:**
+- ✅ Ordem total: todos entregam na mesma ordem
+- ✅ Causalidade preservada
+- ✅ Determinismo: desempate por `node_id`
+
+**Cliente:**
+- Mantém buffer ordenado próprio
+- Só exibe mensagens quando na ordem correta
+- Garante que usuário vê mensagens na ordem global
+
 ### Sincronização de Réplicas
 
 - Novo nó que entra solicita histórico de peers
-- Histórico é sincronizado automaticamente
+- Histórico já vem ordenado por `(lamport_ts, origin_node)`
+- Relógio de Lamport inicializado com máximo visto
 - Mensagens são salvas em disco a cada 5 minutos
-- Ao reiniciar, nó carrega histórico do arquivo JSON
-
-## Possíveis extensões
-
-- Implementar ordenação total com relógios de Lamport ou vetoriais
-- Implementar eleição de líder e coordenação distribuída
-- Adicionar criptografia TLS nas conexões RPC
-- Interface web com WebSocket
+- Ao reiniciar, nó carrega histórico e relógio do arquivo JSON
 
 ## Requisitos
 
@@ -182,6 +208,10 @@ HEARTBEAT_TIMEOUT = 60   # segundos
 # Difusão
 PROPAGATION_FANOUT = 3   # peers por propagação
 MSG_ID_CACHE_SIZE = 10000
+
+# Ordenação Total
+LAMPORT_INITIAL_CLOCK = 0
+DELIVERY_CHECK_INTERVAL = 0.1  # 100ms
 ```
 
 ## Estrutura de Dados
@@ -208,8 +238,10 @@ peers = {
     'type': 'CHAT',
     'sender': 'Alice',
     'message': 'Olá mundo!',
-    'timestamp': 1234567890.0,
-    'msg_id': 'node1_42'
+    'timestamp': 1234567890.0,    # timestamp físico
+    'msg_id': 'node1_42',          # ID único
+    'lamport_ts': 156,             # timestamp lógico Lamport
+    'origin_node': 'node1'         # nó de origem
 }
 ```
 

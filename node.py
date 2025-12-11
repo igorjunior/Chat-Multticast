@@ -27,46 +27,60 @@ class ReplicaNode(rpyc.Service):
         return peers_info
     
     def _process_incoming_message(self, msg_dict, sender_node):
-        """Processa mensagem recebida"""
+        """Processa mensagem recebida com ordenação Lamport"""
         msg_id = msg_dict.get('msg_id')
         
+        # Verifica duplicata
         if not msg_id or msg_id in self.node_manager.processed_msg_ids:
             return
         
         self.node_manager.processed_msg_ids.add(msg_id)
-        self.node_manager.history.append(msg_dict)
-        self.node_manager.notify_local_clients(msg_dict)
+        
+        # Atualiza relógio de Lamport
+        lamport_ts = msg_dict.get('lamport_ts', 0)
+        self.node_manager.update_lamport_clock(lamport_ts)
+        
+        # Adiciona ao buffer (não ao history!)
+        self.node_manager.add_to_holdback_buffer(msg_dict)
+        
+        # Propaga para outros peers
         self.node_manager.propagate_message(msg_dict, exclude_peer=sender_node)
     
-    def exposed_receive_chat_message(self, sender, message, timestamp, msg_id, sender_node):
+    def exposed_receive_chat_message(self, sender, message, timestamp, msg_id, lamport_ts, origin_node, sender_node):
         """Recebe mensagem CHAT com parâmetros primitivos"""
         msg_dict = {
             'type': 'CHAT',
             'sender': sender,
             'message': message,
             'timestamp': timestamp,
-            'msg_id': msg_id
+            'msg_id': msg_id,
+            'lamport_ts': lamport_ts,
+            'origin_node': origin_node
         }
         self._process_incoming_message(msg_dict, sender_node)
     
-    def exposed_receive_system_message(self, message, timestamp, msg_id, sender_node):
+    def exposed_receive_system_message(self, message, timestamp, msg_id, lamport_ts, origin_node, sender_node):
         """Recebe mensagem SYSTEM"""
         msg_dict = {
             'type': 'SYSTEM',
             'message': message,
             'timestamp': timestamp,
-            'msg_id': msg_id
+            'msg_id': msg_id,
+            'lamport_ts': lamport_ts,
+            'origin_node': origin_node
         }
         self._process_incoming_message(msg_dict, sender_node)
     
-    def exposed_receive_read_confirm(self, reader, ref_msg_id, timestamp, msg_id, sender_node):
+    def exposed_receive_read_confirm(self, reader, ref_msg_id, timestamp, msg_id, lamport_ts, origin_node, sender_node):
         """Recebe confirmação de leitura"""
         msg_dict = {
             'type': 'READ_CONFIRM',
             'reader': reader,
             'ref_msg_id': ref_msg_id,
             'timestamp': timestamp,
-            'msg_id': msg_id
+            'msg_id': msg_id,
+            'lamport_ts': lamport_ts,
+            'origin_node': origin_node
         }
         self._process_incoming_message(msg_dict, sender_node)
     
@@ -140,13 +154,25 @@ class ReplicaNode(rpyc.Service):
         """Atualiza lista de peers (mudanças)"""
         peers_dict_local = {}
         try:
+            # Converte peers_dict para dict local se for netref
+            if not isinstance(peers_dict, dict):
+                # Tenta converter manualmente iterando
+                try:
+                    temp_dict = {}
+                    for key in peers_dict:
+                        temp_dict[key] = peers_dict[key]
+                    peers_dict = temp_dict
+                except:
+                    # Se falhar, retorna silenciosamente
+                    return
+            
             for node_id, peer_info in peers_dict.items():
                 peers_dict_local[str(node_id)] = {
                     'host': str(peer_info['host']),
                     'port': int(peer_info['port'])
                 }
         except Exception as e:
-            print(f"Erro ao processar peers_dict: {e}")
+            # Falhas de conexão são esperadas quando peers estão caindo
             return
         
         with self.node_manager.peers_lock:
@@ -198,15 +224,18 @@ class ReplicaNode(rpyc.Service):
         }, exclude=None)
         
         # Cria mensagem SYSTEM de join
+        lamport_ts = self.node_manager.increment_lamport_clock()
         system_msg = {
             'type': 'SYSTEM',
             'message': f'{username} entrou no chat',
             'timestamp': time.time(),
-            'msg_id': self.node_manager.get_next_msg_id()
+            'msg_id': self.node_manager.get_next_msg_id(),
+            'lamport_ts': lamport_ts,
+            'origin_node': self.node_manager.node_id
         }
         
-        # Adiciona à réplica local
-        self.node_manager.history.append(system_msg)
+        # Adiciona ao holdback buffer (não ao history imediatamente!)
+        self.node_manager.add_to_holdback_buffer(system_msg)
         
         # Propaga mensagem
         self.node_manager.propagate_message(system_msg, exclude_peer=None)
@@ -223,15 +252,18 @@ class ReplicaNode(rpyc.Service):
         print(f"{username} saiu do chat (no {self.node_manager.node_id})")
         
         # Cria mensagem SYSTEM de leave
+        lamport_ts = self.node_manager.increment_lamport_clock()
         system_msg = {
             'type': 'SYSTEM',
             'message': f'{username} saiu do chat',
             'timestamp': time.time(),
-            'msg_id': self.node_manager.get_next_msg_id()
+            'msg_id': self.node_manager.get_next_msg_id(),
+            'lamport_ts': lamport_ts,
+            'origin_node': self.node_manager.node_id
         }
         
-        # Adiciona à réplica local
-        self.node_manager.history.append(system_msg)
+        # Adiciona ao holdback buffer (não ao history imediatamente!)
+        self.node_manager.add_to_holdback_buffer(system_msg)
         
         # Propaga mensagem
         self.node_manager.propagate_message(system_msg, exclude_peer=None)
@@ -244,19 +276,19 @@ class ReplicaNode(rpyc.Service):
             if username not in self.node_manager.local_clients:
                 return False
         
+        lamport_ts = self.node_manager.increment_lamport_clock()
         chat_msg = {
             'type': 'CHAT',
             'sender': username,
             'message': text,
             'timestamp': time.time(),
-            'msg_id': self.node_manager.get_next_msg_id()
+            'msg_id': self.node_manager.get_next_msg_id(),
+            'lamport_ts': lamport_ts,
+            'origin_node': self.node_manager.node_id
         }
         
-        # Adiciona à réplica local
-        self.node_manager.history.append(chat_msg)
-        
-        # Notifica clientes locais
-        self.node_manager.notify_local_clients(chat_msg)
+        # Adiciona ao holdback buffer
+        self.node_manager.add_to_holdback_buffer(chat_msg)
         
         # Propaga mensagem
         self.node_manager.propagate_message(chat_msg, exclude_peer=None)
@@ -269,16 +301,19 @@ class ReplicaNode(rpyc.Service):
     
     def exposed_read_confirm(self, username, msg_id):
         """Confirmação de leitura"""
+        lamport_ts = self.node_manager.increment_lamport_clock()
         confirm_msg = {
             'type': 'READ_CONFIRM',
             'reader': username,
             'msg_id': self.node_manager.get_next_msg_id(),  # Gera ID único para confirmação
             'ref_msg_id': msg_id,  # Referência à mensagem original
-            'timestamp': time.time()
+            'timestamp': time.time(),
+            'lamport_ts': lamport_ts,
+            'origin_node': self.node_manager.node_id
         }
         
-        # Adiciona ao histórico
-        self.node_manager.history.append(confirm_msg)
+        # Adiciona ao holdback buffer
+        self.node_manager.add_to_holdback_buffer(confirm_msg)
         
         # Propaga confirmação
         self.node_manager.propagate_message(confirm_msg, exclude_peer=None)
@@ -355,6 +390,15 @@ class NodeManager:
         self.heartbeat_sender_thread = None
         self.heartbeat_monitor_thread = None
         self.auto_save_thread = None
+        self.delivery_thread = None
+        
+        # Relógio de Lamport
+        self.lamport_clock = LAMPORT_INITIAL_CLOCK
+        self.clock_lock = threading.Lock()
+        
+        # Buffer de holdback (mensagens aguardando ordenação)
+        self.holdback_buffer = []
+        self.buffer_lock = threading.Lock()
         
         # Carrega histórico persistido
         self.load_history_from_disk()
@@ -363,6 +407,18 @@ class NodeManager:
         with self.msg_counter_lock:
             self.msg_counter += 1
             return f"{self.node_id}_{self.msg_counter}"
+    
+    def increment_lamport_clock(self):
+        """Incrementa relógio de Lamport ao enviar mensagem"""
+        with self.clock_lock:
+            self.lamport_clock += 1
+            return self.lamport_clock
+    
+    def update_lamport_clock(self, received_ts):
+        """Atualiza relógio ao receber mensagem"""
+        with self.clock_lock:
+            self.lamport_clock = max(self.lamport_clock, received_ts) + 1
+            return self.lamport_clock
     
     def start_server(self):
         """Inicia servidor RPC em thread separada"""
@@ -515,6 +571,8 @@ class NodeManager:
                         message=msg['message'],
                         timestamp=msg['timestamp'],
                         msg_id=msg['msg_id'],
+                        lamport_ts=msg.get('lamport_ts', 0),
+                        origin_node=msg.get('origin_node', ''),
                         sender_node=self.node_id
                     )
                 elif msg_type == 'SYSTEM':
@@ -522,6 +580,8 @@ class NodeManager:
                         message=msg['message'],
                         timestamp=msg['timestamp'],
                         msg_id=msg['msg_id'],
+                        lamport_ts=msg.get('lamport_ts', 0),
+                        origin_node=msg.get('origin_node', ''),
                         sender_node=self.node_id
                     )
                 elif msg_type == 'READ_CONFIRM':
@@ -530,6 +590,8 @@ class NodeManager:
                         ref_msg_id=msg['ref_msg_id'],
                         timestamp=msg['timestamp'],
                         msg_id=msg['msg_id'],
+                        lamport_ts=msg.get('lamport_ts', 0),
+                        origin_node=msg.get('origin_node', ''),
                         sender_node=self.node_id
                     )
             except Exception as e:
@@ -667,16 +729,20 @@ class NodeManager:
                 self.remove_peer_connection(node_id)
         
         print(f"Peer {node_id} removido (timeout)")
-        
+
         # Cria mensagem SYSTEM
+        lamport_ts = self.increment_lamport_clock()
         system_msg = {
             'type': 'SYSTEM',
             'message': f'{node_id} saiu (timeout)',
             'timestamp': time.time(),
-            'msg_id': self.get_next_msg_id()
+            'msg_id': self.get_next_msg_id(),
+            'lamport_ts': lamport_ts,
+            'origin_node': self.node_id
         }
         
-        self.history.append(system_msg)
+        # Adiciona ao holdback buffer
+        self.add_to_holdback_buffer(system_msg)
         self.propagate_message(system_msg, exclude_peer=None)
         
         # Broadcast lista atualizada
@@ -690,6 +756,40 @@ class NodeManager:
             except:
                 pass
             del self.peers[node_id]
+    
+    def add_to_holdback_buffer(self, msg):
+        """Adiciona mensagem ao buffer de holdback"""
+        with self.buffer_lock:
+            self.holdback_buffer.append(msg)
+            # Ordena por (lamport_ts, origin_node)
+            self.holdback_buffer.sort(
+                key=lambda m: (m.get('lamport_ts', 0), m.get('origin_node', ''))
+            )
+    
+    def try_deliver_stable_messages(self):
+        """Entrega mensagens que satisfazem condição de estabilidade"""
+        with self.buffer_lock:
+            with self.clock_lock:
+                current_clock = self.lamport_clock
+            
+            delivered = []
+            for msg in self.holdback_buffer:
+                msg_ts = msg.get('lamport_ts', 0)
+                
+                # Condição de estabilidade: lamport_ts < clock_local
+                if msg_ts < current_clock:
+                    # Entrega a mensagem
+                    with self.history_lock:
+                        self.history.append(msg)
+                    self.notify_local_clients(msg)
+                    delivered.append(msg)
+                else:
+                    # Buffer ordenado, se este não pode, próximos também não
+                    break
+            
+            # Remove mensagens entregues do buffer
+            for msg in delivered:
+                self.holdback_buffer.remove(msg)
     
     def broadcast_peer_list(self):
         """Broadcast"""
@@ -742,6 +842,8 @@ class NodeManager:
                             'message': str(msg.get('message', '')),
                             'reader': str(msg.get('reader', '')),
                             'ref_msg_id': str(msg.get('ref_msg_id', '')),
+                            'lamport_ts': int(msg.get('lamport_ts', 0)),
+                            'origin_node': str(msg.get('origin_node', '')),
                         })
                 except Exception as e:
                     print(f"Erro ao processar remote_history: {e}")
@@ -750,12 +852,22 @@ class NodeManager:
                 remote_ids = {msg.get('msg_id') for msg in remote_history_local}
                 local_ids = {msg.get('msg_id') for msg in self.history}
                 
+                # Atualiza relógio Lamport com máximo visto
+                max_lamport = 0
+                for msg in remote_history_local:
+                    if 'lamport_ts' in msg:
+                        max_lamport = max(max_lamport, msg['lamport_ts'])
+                
+                with self.clock_lock:
+                    self.lamport_clock = max(self.lamport_clock, max_lamport)
+                
                 for msg in remote_history_local:
                     if msg.get('msg_id') not in local_ids:
                         self.history.append(msg)
                         self.processed_msg_ids.add(msg.get('msg_id'))
                 
-                self.history.sort(key=lambda m: m.get('timestamp', 0))
+                # Ordena por (lamport_ts, origin_node) para manter ordem total
+                self.history.sort(key=lambda m: (m.get('lamport_ts', 0), m.get('origin_node', '')))
                 
                 print(f"Histórico sincronizado com {peer_id}: {len(self.history)} mensagens")
                 break
@@ -794,7 +906,16 @@ class NodeManager:
                 with self.msg_counter_lock:
                     self.msg_counter = max_counter
                 
-                print(f"Histórico carregado: {len(self.history)} mensagens (contador em {self.msg_counter})")
+                # Inicializa relógio Lamport com maior timestamp visto
+                max_lamport = 0
+                for msg in self.history:
+                    if 'lamport_ts' in msg:
+                        max_lamport = max(max_lamport, msg['lamport_ts'])
+                
+                with self.clock_lock:
+                    self.lamport_clock = max_lamport
+                
+                print(f"Histórico carregado: {len(self.history)} mensagens (contador em {self.msg_counter}, clock em {max_lamport})")
         except FileNotFoundError:
             self.history = []
             self.processed_msg_ids = set()
@@ -813,6 +934,20 @@ class NodeManager:
         
         self.auto_save_thread = threading.Thread(target=auto_save, daemon=True)
         self.auto_save_thread.start()
+    
+    def start_delivery_thread(self):
+        """Thread que periodicamente tenta entregar mensagens estáveis"""
+        def delivery_loop():
+            while self.running:
+                try:
+                    self.try_deliver_stable_messages()
+                    time.sleep(DELIVERY_CHECK_INTERVAL)
+                except Exception as e:
+                    if self.running:
+                        print(f"Erro na thread de entrega: {e}")
+        
+        self.delivery_thread = threading.Thread(target=delivery_loop, daemon=True)
+        self.delivery_thread.start()
     
     def run(self):
         """Inicia nó"""
@@ -842,6 +977,7 @@ class NodeManager:
         self.start_heartbeat_sender()
         self.start_heartbeat_monitor()
         self.start_auto_save()
+        self.start_delivery_thread()
         
         print(f"Nó {self.node_id} rodando. Pressione Ctrl+C para encerrar.")
         

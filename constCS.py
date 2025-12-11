@@ -19,3 +19,8 @@ MESSAGE_TIMESTAMP_TOLERANCE = 3600  # 1 hora de tolerância para validação
 
 # Persistência
 HISTORY_SAVE_INTERVAL = 300  # Salva histórico a cada 5 minutos
+
+# Configurações de Ordenação Total
+LAMPORT_INITIAL_CLOCK = 0
+HOLDBACK_BUFFER_MAX_SIZE = 5000
+DELIVERY_CHECK_INTERVAL = 0.1  # 100ms

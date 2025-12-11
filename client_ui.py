@@ -17,6 +17,12 @@ class ChatClientUI:
         self.confirmations = {}
         self.rpc_lock = threading.Lock()
         
+        # Buffer ordenado para garantir ordem total de exibição
+        self.pending_messages = []
+        self.pending_lock = threading.Lock()
+        self.last_delivered_lamport = 0
+        self.last_delivered_origin = ''
+        
     def connect(self):
         """Estabelece conexão RPC com nó"""
         try:
@@ -66,39 +72,20 @@ class ChatClientUI:
         tipo = msg.get('type')
         
         if tipo == 'HISTORY':
+            # Histórico já vem ordenado, processa diretamente
             self.history = msg['messages']
+            # Atualiza last_delivered com última mensagem do histórico
+            if self.history:
+                last_msg = self.history[-1]
+                self.last_delivered_lamport = last_msg.get('lamport_ts', 0)
+                self.last_delivered_origin = last_msg.get('origin_node', '')
             print(f"Historico sincronizado ({len(self.history)} mensagens)\n")
-            
-        elif tipo == 'CHAT':
-            msg_id = msg.get('msg_id')
-            if not any(m.get('msg_id') == msg_id for m in self.history):
-                self.history.append(msg)
-            
-            ts = datetime.fromtimestamp(msg['timestamp']).strftime('%H:%M:%S')
-            print(f"[{ts}] {msg['sender']}: {msg['message']} (ID:{msg['msg_id']})")
-            
-            if msg['sender'] != self.username:
-                self.send_read_confirmation(msg['msg_id'])
-            
-        elif tipo == 'SYSTEM':
-            msg_id = msg.get('msg_id')
-            if not any(m.get('msg_id') == msg_id for m in self.history):
-                self.history.append(msg)
-            ts = datetime.fromtimestamp(msg['timestamp']).strftime('%H:%M:%S')
-            print(f"[{ts}] [SISTEMA] {msg['message']}")
-            
-            if 'desligado' in msg['message'].lower() or 'saiu' in msg['message'].lower():
-                # Não encerra, apenas informa
-                pass
-            
-        elif tipo == 'READ_CONFIRM':
-            mid = msg['msg_id']
-            reader = msg.get('reader')
-            if mid and reader:
-                if mid not in self.confirmations:
-                    self.confirmations[mid] = []
-                if reader not in self.confirmations[mid]:
-                    self.confirmations[mid].append(reader)
+        
+        elif tipo in ['CHAT', 'SYSTEM', 'READ_CONFIRM']:
+            # Adiciona ao buffer ordenado
+            self.add_to_pending_buffer(msg)
+            # Tenta entregar mensagens na ordem
+            self.try_deliver_pending_messages()
             
     def send_message(self, text):
         """Envia mensagem para nó local via RPC"""
@@ -116,6 +103,80 @@ class ChatClientUI:
                 self.rpc.root.exposed_read_confirm(self.username, msg_id)
         except:
             pass
+    
+    def add_to_pending_buffer(self, msg):
+        """Adiciona mensagem ao buffer ordenado"""
+        with self.pending_lock:
+            self.pending_messages.append(msg)
+            # Ordena por (lamport_ts, origin_node)
+            self.pending_messages.sort(
+                key=lambda m: (m.get('lamport_ts', 0), m.get('origin_node', ''))
+            )
+    
+    def try_deliver_pending_messages(self):
+        """Entrega mensagens do buffer que estão na ordem correta"""
+        with self.pending_lock:
+            delivered = []
+            
+            for msg in self.pending_messages:
+                msg_ts = msg.get('lamport_ts', 0)
+                msg_origin = msg.get('origin_node', '')
+                
+                # Verifica se pode entregar (ordem correta)
+                can_deliver = False
+                
+                # Caso inicial: se ainda não entregou nada, entrega a primeira mensagem
+                if self.last_delivered_lamport == 0 and self.last_delivered_origin == '':
+                    can_deliver = True
+                elif msg_ts > self.last_delivered_lamport:
+                    can_deliver = True
+                elif msg_ts == self.last_delivered_lamport:
+                    if msg_origin > self.last_delivered_origin:
+                        can_deliver = True
+                
+                if can_deliver:
+                    # Entrega a mensagem
+                    self._display_message(msg)
+                    delivered.append(msg)
+                    # Atualiza último entregue
+                    self.last_delivered_lamport = msg_ts
+                    self.last_delivered_origin = msg_origin
+                else:
+                    # Buffer ordenado, se este não pode, próximos também não
+                    break
+            
+            # Remove mensagens entregues
+            for msg in delivered:
+                self.pending_messages.remove(msg)
+    
+    def _display_message(self, msg):
+        """Exibe mensagem na tela (lógica original de process_received_message)"""
+        tipo = msg.get('type')
+        msg_id = msg.get('msg_id')
+        
+        # Adiciona ao histórico local
+        if not any(m.get('msg_id') == msg_id for m in self.history):
+            self.history.append(msg)
+        
+        if tipo == 'CHAT':
+            ts = datetime.fromtimestamp(msg['timestamp']).strftime('%H:%M:%S')
+            print(f"[{ts}] {msg['sender']}: {msg['message']} (ID:{msg['msg_id']})")
+            
+            if msg['sender'] != self.username:
+                self.send_read_confirmation(msg['msg_id'])
+        
+        elif tipo == 'SYSTEM':
+            ts = datetime.fromtimestamp(msg['timestamp']).strftime('%H:%M:%S')
+            print(f"[{ts}] [SISTEMA] {msg['message']}")
+        
+        elif tipo == 'READ_CONFIRM':
+            mid = msg['msg_id']
+            reader = msg.get('reader')
+            if mid and reader:
+                if mid not in self.confirmations:
+                    self.confirmations[mid] = []
+                if reader not in self.confirmations[mid]:
+                    self.confirmations[mid].append(reader)
             
     def show_history(self):
         """Exibe histórico obtido do nó"""
