@@ -1,87 +1,218 @@
-# Chat Distribuído - Trabalho SD
+# Chat Distribuído P2P
 
-Sistema de chat com comunicação multicast e histórico sincronizado usando RPC e filas de mensagens.
+Sistema de chat peer-to-peer com comunicação RPC, difusão de mensagens e histórico replicado.
 
 ## Funcionalidades
 
-O sistema implementa um chat onde varios clientes se conectam a um servidor central que distribui as mensagens para todos (multicast). Cada cliente mantem uma copia local do historico de mensagens.
+O sistema implementa um chat distribuído onde múltiplos nós servidores (peers) se conectam formando uma rede P2P. Cada nó mantém uma réplica completa do histórico e propaga mensagens para outros peers. Clientes (usuários) se conectam aos nós para enviar e receber mensagens.
 
 Recursos implementados:
-- Mensagens distribuidas para todos os clientes via fila
-- Historico replicado em cada cliente
-- IDs sequenciais para manter ordem das mensagens
-- Confirmacoes de leitura
-- Novos clientes recebem todo o historico ao entrar
+- Rede P2P com comunicação RPC (rpyc)
+- Bootstrap leve para descoberta inicial de peers
+- Difusão eficiente com propagação controlada (N*log(N))
+- Discovery distribuído via JOIN propagado
+- Heartbeat para detecção de falhas (timeout 60s)
+- Histórico replicado em todos os nós
+- Persistência de mensagens em disco
+- Confirmações de leitura
+- Prevenção de duplicatas com cache de IDs
+
+## Arquitetura
+
+**Bootstrap Node:** Fornece lista inicial de peers quando novos nós entram na rede. É um servidor P2P.
+
+**Peer Nodes:** São os servidores do sistema P2P. Cada nó/peer é um servidor RPC que mantém conexões com outros peers e propaga mensagens. Peers não são os clientes/usuários do chat, são os nós servidores da rede distribuída.
+
+**Client UI:** Interface leve que conecta a um peer/nó local para enviar/receber mensagens. Representa um usuário do chat.
+
+Cada nó armazena:
+- Lista de peers (host, porta, conexão RPC)
+- Histórico completo de mensagens (réplica local)
+- Cache de IDs processados (previne duplicatas)
+- Status de heartbeat dos peers
 
 ## Arquivos
 
-- server.py: servidor RPC que gerencia as conexoes e distribui mensagens
-- client.py: cliente de chat com interface de linha de comando
-- constCS.py: configuracoes (host, porta, buffer)
+- `node.py`: nó P2P com servidor RPC e lógica de propagação
+- `client_ui.py`: cliente de chat com interface de linha de comando
+- `constCS.py`: configurações (portas, timeouts, fanout)
+- `start_bootstrap.bat`: script para iniciar nó bootstrap
 
 ## Protocolo
 
-Comunicacao via XML-RPC. Cliente chama metodos RPC no servidor:
-- join(client_id): entra no chat
-- send_message(client_id, text): envia mensagem
-- read_confirm(client_id, msg_id): confirma leitura
-- get_messages(client_id): consome mensagens da fila
-- leave(client_id): sai do chat
+Comunicação via RPC (rpyc). Cada nó expõe métodos para:
 
-Tipos de mensagem na fila:
-- HISTORY: sincronizacao do historico
-- CHAT: mensagem de conversa
-- READ_CONFIRM: confirmacao de leitura
-- SYSTEM: notificacoes do sistema
+**Gerenciamento de rede:**
+- `get_initial_peers()`: obtém lista inicial do bootstrap
+- `receive_join()`: recebe JOIN de novo peer e propaga
+- `heartbeat()`: recebe heartbeat de peer
+- `peer_list_update()`: sincroniza lista de peers
+
+**Mensagens de chat:**
+- `receive_chat_message()`: recebe mensagem CHAT com propagação
+- `receive_system_message()`: recebe mensagem SYSTEM
+- `receive_read_confirm()`: recebe confirmação de leitura
+
+**Interface com cliente:**
+- `join_user()`: usuário entra no chat
+- `send_message()`: envia mensagem
+- `get_messages()`: consome mensagens da fila
+- `read_confirm()`: confirma leitura
+- `leave_user()`: sai do chat
+
+Tipos de mensagem:
+- `CHAT`: mensagem de conversa
+- `SYSTEM`: notificações do sistema
+- `READ_CONFIRM`: confirmação de leitura
+- `JOIN`: entrada de novo peer na rede
 
 ## Utilização
 
-Iniciar servidor RPC:
+### Iniciar nó bootstrap
+
 ```bash
-python server.py
+python node.py --node-id bootstrap --port 5679 --bootstrap
 ```
 
-Conectar clientes:
+Ou simplesmente execute e forneça os argumentos quando solicitado:
 ```bash
-python client.py Erick
-python client.py Igor
-python client.py Matheus
+python node.py
 ```
 
-Comandos disponiveis no cliente:
+### Iniciar nós peers
+
+```bash
+python node.py --node-id node2 --port 5680
+python node.py --node-id node3 --port 5681
+```
+
+Ou execute sem argumentos e será solicitado:
+```bash
+python node.py
+```
+
+### Conectar clientes
+
+```bash
+python client_ui.py --username Alice --node-port 5679
+python client_ui.py --username Bob --node-port 5680
+```
+
+Ou execute sem argumentos:
+```bash
+python client_ui.py
+```
+
+Comandos disponíveis no cliente:
 - Digite texto para enviar mensagem
-- /history - ver historico
-- /confirmations - ver confirmacoes de leitura  
-- /quit - sair
+- `/history` - ver histórico
+- `/confirmations` - ver confirmações de leitura  
+- `/quit` - sair
 
 ## Como funciona
 
-O servidor usa XML-RPC para receber comandos dos clientes e uma fila de mensagens (queue.Queue) para distribuir mensagens via multicast. Cada cliente tem sua propria fila e faz polling para consumir mensagens.
+### Inicialização e Discovery
 
-O servidor atribui IDs sequenciais (1, 2, 3...) para cada mensagem, garantindo que todos os clientes vejam na mesma ordem. Quando um novo cliente entra, ele recebe todo o historico do servidor para sincronizar.
+1. Nó bootstrap inicia e aguarda conexões
+2. Novos peers se conectam ao bootstrap e obtêm lista inicial de peers
+3. Cada peer envia JOIN para peers iniciais
+4. JOIN é propagado pela rede (difusão)
+5. Peers respondem com ACK, descobrindo-se mutuamente
+6. Resultado: rede P2P totalmente conectada
 
-Cada mensagem tem:
-- ID unico (atribuido pelo servidor)
-- Timestamp
-- Sender
-- Conteudo
+### Propagação de Mensagens
 
-O sistema resolve o problema de ordenacao de mensagens usando o servidor como coordenador central. Clientes desconectados sao removidos automaticamente.
+O sistema usa **difusão controlada** para evitar N² mensagens:
 
-## Proximas etapas do trabalho
+1. Usuário envia mensagem via client_ui
+2. Nó local gera ID único (`node_id_counter`)
+3. Mensagem é adicionada ao histórico local
+4. Nó propaga para subset de peers (fanout configurável)
+5. Cada peer que recebe:
+   - Verifica se já processou (cache de IDs)
+   - Adiciona ao histórico local
+   - Propaga para seus vizinhos
+6. Mensagem alcança todos os nós (~N*log(N) chamadas RPC)
 
-- Parte 3: Implementar ordenacao total (Cap. 5)
-- Parte 4: Mecanismo de coordenacao mais leve (Cap. 7)
+### Detecção de Falhas
+
+Sistema de heartbeat detecta nós inativos:
+
+1. Cada nó envia heartbeat a cada 30-40s (com jitter)
+2. Monitor verifica timeouts a cada 10s
+3. Se peer não responde por 60s:
+   - Peer é removido da lista local
+   - Conexão RPC é fechada
+   - Mensagem SYSTEM notifica saída
+4. Se peer volta, reconecta ao bootstrap e sincroniza
+
+### Sincronização de Réplicas
+
+- Novo nó que entra solicita histórico de peers
+- Histórico é sincronizado automaticamente
+- Mensagens são salvas em disco a cada 5 minutos
+- Ao reiniciar, nó carrega histórico do arquivo JSON
+
+## Possíveis extensões
+
+- Implementar ordenação total com relógios de Lamport ou vetoriais
+- Implementar eleição de líder e coordenação distribuída
+- Adicionar criptografia TLS nas conexões RPC
+- Interface web com WebSocket
 
 ## Requisitos
 
-Python 3
+- Python 3
+- rpyc (`pip install rpyc`)
 
-## Configuracao
+## Configuração
 
-Para mudar host/porta edite constCS.py:
+Para mudar portas e timeouts edite `constCS.py`:
+
 ```python
-SERVER_HOST = 'localhost'
-SERVER_PORT = 5679
-BUFFER_SIZE = 4096
+# P2P
+BOOTSTRAP_HOST = 'localhost'
+BOOTSTRAP_PORT = 5679
+NODE_BASE_PORT = 5679
+
+# Heartbeat
+HEARTBEAT_INTERVAL = 30  # segundos
+HEARTBEAT_TIMEOUT = 60   # segundos
+
+# Difusão
+PROPAGATION_FANOUT = 3   # peers por propagação
+MSG_ID_CACHE_SIZE = 10000
 ```
+
+## Estrutura de Dados
+
+### Lista de Peers
+
+```python
+peers = {
+    'node_2': {
+        'host': 'localhost',
+        'port': 5680,
+        'connection': <rpyc_conn>,
+        'last_heartbeat': 1234567890.0,
+        'status': 'ACTIVE',
+        'missed_heartbeats': 0
+    }
+}
+```
+
+### Mensagem
+
+```python
+{
+    'type': 'CHAT',
+    'sender': 'Alice',
+    'message': 'Olá mundo!',
+    'timestamp': 1234567890.0,
+    'msg_id': 'node1_42'
+}
+```
+
+### Histórico
+
+Lista replicada em todos os nós, salva em `history_<node_id>.json`.
